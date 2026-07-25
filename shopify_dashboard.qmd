@@ -1,0 +1,411 @@
+---
+title: "Shopify Sales Dashboard"
+author: "Ron Stephen Sabilla"
+format:
+  dashboard:
+    theme: cosmo
+    scrolling: true
+    nav-buttons:
+      - icon: github
+        href: https://github.com
+logo: ""
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(scales)
+library(lubridate)
+library(janitor)
+library(plotly)
+library(DT)
+library(bslib)
+
+# ── Load & clean ──────────────────────────────────────────────────────────────
+# Place your downloaded CSV (from Kaggle) in the same folder as this .qmd file
+# and update the filename below if needed.
+df_raw <- read_csv("shopify_sales.csv", show_col_types = FALSE)
+
+# Normalize column names to snake_case so the code below works regardless
+# of how Kaggle capitalizes them
+df <- df_raw |> clean_names()
+
+# ── Column name mapping ───────────────────────────────────────────────────────
+# Update the RIGHT-HAND side values to match your CSV's snake_case column names
+col_map <- c(
+  order_date = "created_at",
+  revenue    = "total_price",
+  category   = "product_type",
+  product    = "lineitem_name",
+  quantity   = "lineitem_quantity",
+  status     = "fulfillment_status",
+  payment    = "payment_method",
+  country    = "billing_country",
+  city       = "billing_city"
+)
+
+# ── Rename to standard names used throughout ──────────────────────────────────
+# any_of() safely skips columns that don't exist in this dataset
+df <- df |>
+  rename(any_of(col_map)) |>
+  mutate(
+    order_date = parse_date_time(order_date,
+                   orders = c("ymd HMS", "ymd HM", "ymd", "mdy", "dmy"),
+                   quiet  = TRUE),
+    order_day  = as_date(order_date),
+    order_hour = hour(order_date),
+    order_wday = wday(order_date, label = TRUE, abbr = TRUE),
+    across(any_of(c("revenue", "quantity")), as.numeric)
+  ) |>
+  filter(!is.na(revenue), revenue >= 0)
+
+# ── KPI values ────────────────────────────────────────────────────────────────
+total_revenue   <- sum(df$revenue, na.rm = TRUE)
+total_orders    <- n_distinct(df$order_id %||% seq_len(nrow(df)))
+avg_order_value <- total_revenue / max(total_orders, 1)
+total_units     <- sum(df$quantity, na.rm = TRUE)
+
+# Colour palette
+clr <- c("#5C4DE5", "#00B4D8", "#0077B6", "#48CAE4",
+         "#90E0EF", "#ADE8F4", "#CAF0F8", "#03045E")
+```
+
+# Overview
+
+## Row {height=20%}
+
+```{r}
+#| content: valuebox
+#| title: "Total Revenue"
+list(
+  icon  = "currency-dollar",
+  color = "primary",
+  value = dollar(total_revenue, accuracy = 1)
+)
+```
+
+```{r}
+#| content: valuebox
+#| title: "Total Orders"
+list(
+  icon  = "bag-check",
+  color = "info",
+  value = comma(total_orders)
+)
+```
+
+```{r}
+#| content: valuebox
+#| title: "Avg Order Value"
+list(
+  icon  = "graph-up-arrow",
+  color = "success",
+  value = dollar(avg_order_value, accuracy = 0.01)
+)
+```
+
+```{r}
+#| content: valuebox
+#| title: "Units Sold"
+list(
+  icon  = "box-seam",
+  color = "warning",
+  value = comma(total_units)
+)
+```
+
+## Row {height=40%}
+
+### Revenue Over Time {width=60%}
+
+```{r}
+daily_rev <- df |>
+  group_by(order_day) |>
+  summarise(revenue = sum(revenue, na.rm = TRUE), .groups = "drop")
+
+p1 <- ggplot(daily_rev, aes(x = order_day, y = revenue)) +
+  geom_area(fill = "#5C4DE5", alpha = 0.2) +
+  geom_line(color = "#5C4DE5", linewidth = 1) +
+  scale_y_continuous(labels = dollar_format(scale = 1e-3, suffix = "K")) +
+  scale_x_date(date_labels = "%b %d") +
+  labs(x = NULL, y = "Daily Revenue") +
+  theme_minimal(base_size = 13) +
+  theme(panel.grid.minor = element_blank())
+
+ggplotly(p1, tooltip = c("x", "y")) |>
+  layout(hovermode = "x unified")
+```
+
+### Orders by Status {width=40%}
+
+```{r}
+if ("status" %in% names(df)) {
+  status_tbl <- df |>
+    count(status) |>
+    filter(!is.na(status)) |>
+    mutate(status = str_to_title(status))
+
+  plot_ly(status_tbl,
+    labels = ~status, values = ~n,
+    type   = "pie",
+    hole   = 0.5,
+    marker = list(colors = clr),
+    textinfo = "label+percent"
+  ) |>
+    layout(
+      showlegend = TRUE,
+      legend = list(orientation = "h")
+    )
+} else {
+  cat("No 'fulfillment_status' column found — update status_col in setup.")
+}
+```
+
+## Row {height=40%}
+
+### Sales by Product Category {width=50%}
+
+```{r}
+if ("category" %in% names(df)) {
+  cat_rev <- df |>
+    group_by(category) |>
+    summarise(revenue = sum(revenue, na.rm = TRUE), .groups = "drop") |>
+    filter(!is.na(category)) |>
+    arrange(desc(revenue)) |>
+    slice_head(n = 10) |>
+    mutate(category = fct_reorder(category, revenue))
+
+  p2 <- ggplot(cat_rev, aes(x = category, y = revenue, fill = category)) +
+    geom_col(show.legend = FALSE) +
+    scale_fill_manual(values = colorRampPalette(clr)(nrow(cat_rev))) +
+    scale_y_continuous(labels = dollar_format(scale = 1e-3, suffix = "K")) +
+    coord_flip() +
+    labs(x = NULL, y = "Revenue") +
+    theme_minimal(base_size = 13) +
+    theme(panel.grid.minor = element_blank())
+
+  ggplotly(p2, tooltip = c("x", "y"))
+} else {
+  cat("No category column found — update category_col in setup.")
+}
+```
+
+### Peak Sales by Hour {width=50%}
+
+```{r}
+hourly <- df |>
+  group_by(order_hour) |>
+  summarise(
+    orders  = n(),
+    revenue = sum(revenue, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+p3 <- ggplot(hourly, aes(x = order_hour, y = orders)) +
+  geom_col(fill = "#00B4D8", alpha = 0.85) +
+  scale_x_continuous(breaks = 0:23, labels = paste0(0:23, "h")) +
+  labs(x = "Hour of Day", y = "Number of Orders") +
+  theme_minimal(base_size = 13) +
+  theme(
+    panel.grid.minor = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+
+ggplotly(p3, tooltip = c("x", "y"))
+```
+
+# Products
+
+## Row {height=50%}
+
+### Top 10 Products by Revenue
+
+```{r}
+if ("product" %in% names(df)) {
+  top_products <- df |>
+    group_by(product) |>
+    summarise(
+      revenue = sum(revenue, na.rm = TRUE),
+      orders  = n(),
+      units   = sum(quantity, na.rm = TRUE),
+      .groups = "drop"
+    ) |>
+    filter(!is.na(product)) |>
+    arrange(desc(revenue)) |>
+    slice_head(n = 10) |>
+    mutate(product = fct_reorder(product, revenue))
+
+  p4 <- ggplot(top_products, aes(x = product, y = revenue, fill = revenue)) +
+    geom_col(show.legend = FALSE) +
+    scale_fill_gradient(low = "#90E0EF", high = "#03045E") +
+    scale_y_continuous(labels = dollar_format(scale = 1e-3, suffix = "K")) +
+    coord_flip() +
+    labs(x = NULL, y = "Revenue") +
+    theme_minimal(base_size = 13)
+
+  ggplotly(p4, tooltip = c("x", "y"))
+} else {
+  cat("No product column found — update product_col in setup.")
+}
+```
+
+### Sales by Day of Week {width=40%}
+
+```{r}
+wday_rev <- df |>
+  group_by(order_wday) |>
+  summarise(
+    revenue = sum(revenue, na.rm = TRUE),
+    orders  = n(),
+    .groups = "drop"
+  )
+
+p5 <- ggplot(wday_rev, aes(x = order_wday, y = revenue, fill = order_wday)) +
+  geom_col(show.legend = FALSE) +
+  scale_fill_manual(values = colorRampPalette(clr)(7)) +
+  scale_y_continuous(labels = dollar_format(scale = 1e-3, suffix = "K")) +
+  labs(x = NULL, y = "Revenue") +
+  theme_minimal(base_size = 13)
+
+ggplotly(p5, tooltip = c("x", "y"))
+```
+
+## Row {height=50%}
+
+### Full Product Table
+
+```{r}
+if ("product" %in% names(df)) {
+  df |>
+    group_by(Product = product) |>
+    summarise(
+      Revenue  = dollar(sum(revenue, na.rm = TRUE)),
+      Orders   = comma(n()),
+      Units    = comma(sum(quantity, na.rm = TRUE)),
+      Avg_Price = dollar(mean(revenue, na.rm = TRUE)),
+      .groups = "drop"
+    ) |>
+    arrange(desc(parse_number(Revenue))) |>
+    datatable(
+      options = list(pageLength = 10, scrollX = TRUE),
+      rownames = FALSE,
+      class = "compact stripe hover"
+    )
+}
+```
+
+# Geography
+
+## Row
+
+### Revenue by Country
+
+```{r}
+if ("country" %in% names(df)) {
+  country_rev <- df |>
+    group_by(country) |>
+    summarise(revenue = sum(revenue, na.rm = TRUE), .groups = "drop") |>
+    filter(!is.na(country)) |>
+    arrange(desc(revenue))
+
+  plot_ly(country_rev,
+    type  = "choropleth",
+    locations = ~country,
+    locationmode = "country names",
+    z     = ~revenue,
+    colorscale = "Blues",
+    colorbar = list(title = "Revenue ($)")
+  ) |>
+    layout(
+      geo = list(showframe = FALSE, showcoastlines = TRUE)
+    )
+} else {
+  cat("No country column found — update country_col in setup.")
+}
+```
+
+## Row
+
+### Top 10 Cities by Revenue {width=50%}
+
+```{r}
+if ("city" %in% names(df)) {
+  city_rev <- df |>
+    group_by(city) |>
+    summarise(revenue = sum(revenue, na.rm = TRUE), .groups = "drop") |>
+    filter(!is.na(city)) |>
+    arrange(desc(revenue)) |>
+    slice_head(n = 10) |>
+    mutate(city = fct_reorder(city, revenue))
+
+  p6 <- ggplot(city_rev, aes(x = city, y = revenue, fill = revenue)) +
+    geom_col(show.legend = FALSE) +
+    scale_fill_gradient(low = "#90E0EF", high = "#03045E") +
+    scale_y_continuous(labels = dollar_format(scale = 1e-3, suffix = "K")) +
+    coord_flip() +
+    labs(x = NULL, y = "Revenue") +
+    theme_minimal(base_size = 13)
+
+  ggplotly(p6, tooltip = c("x", "y"))
+} else {
+  cat("No city column found — update city_col in setup.")
+}
+```
+
+### Payment Methods {width=50%}
+
+```{r}
+if ("payment" %in% names(df)) {
+  pay_tbl <- df |>
+    count(payment) |>
+    filter(!is.na(payment)) |>
+    mutate(payment = str_to_title(payment))
+
+  plot_ly(pay_tbl,
+    labels = ~payment, values = ~n,
+    type   = "pie",
+    hole   = 0.4,
+    marker = list(colors = clr),
+    textinfo = "label+percent"
+  ) |>
+    layout(showlegend = TRUE)
+} else {
+  cat("No payment method column found — update payment_col in setup.")
+}
+```
+
+# About
+
+## Row
+
+::: {.card title="About This Dashboard"}
+
+**Dataset:** Shopify Sales Dataset for ML & EDA
+**Source:** [Kaggle — aliiihussain](https://www.kaggle.com/datasets/aliiihussain/shopify-sales-dataset-for-ml-and-eda)
+**Description:** A realistic e-commerce dataset containing Shopify order-level data for sales analysis and customer behavior insights.
+
+### Story
+
+This dashboard tells the story of **where revenue comes from, when customers buy, and which products drive the most value** for a Shopify-based e-commerce store. Even someone unfamiliar with e-commerce can use these four pages to answer the most important business questions:
+
+- **Overview** — How is the store performing overall? What are the peak hours and order fulfillment health?
+- **Products** — Which products and categories generate the most revenue? Are there slow days that need promotion?
+- **Geography** — Where in the world are customers buying from? Which cities are highest-value?
+- **About** — Context and data source.
+
+### Key Takeaways
+
+1. A small number of product categories typically drive the majority of revenue (Pareto effect).
+2. Order volume peaks at specific hours of the day, suggesting optimal times for email campaigns.
+3. Certain days of the week consistently outperform others — useful for scheduling promotions.
+4. Geographic concentration reveals where marketing spend is most effective.
+
+### How to Use
+
+Download the CSV from Kaggle, place it in the same folder as this `.qmd` file, and render with:
+
+```bash
+quarto render shopify_dashboard.qmd
+```
+
+If column names in your CSV differ from the defaults, update the mapping section at the top of the setup chunk.
+:::
